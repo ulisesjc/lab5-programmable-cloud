@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+#
+# Runs on VM-1 (in /srv). Authenticates with the service account key that
+# part3.py passed through metadata and does the Part 1 work: create VM-2
+# running the flask app, make sure the allow-5000 firewall rule exists, and
+# tag VM-2 so the rule applies to it.
+
+import os
+
+import googleapiclient.discovery
+import google.oauth2.service_account as service_account
+from googleapiclient.errors import HttpError
+
+ZONE = 'us-west1-b'
+VM2_NAME = 'flask-vm2'
+MACHINE_TYPE = 'f1-micro'
+FIREWALL_RULE = 'allow-5000'
+NETWORK_TAG = 'allow-5000'
+
+credentials = service_account.Credentials.from_service_account_file('service-credentials.json')
+project = os.getenv('GOOGLE_CLOUD_PROJECT') or credentials.project_id
+compute = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
+
+
+def wait_for_zone_operation(operation):
+    while True:
+        result = compute.zoneOperations().wait(
+            project=project, zone=ZONE, operation=operation).execute()
+        if result['status'] == 'DONE':
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            return result
+
+
+def wait_for_global_operation(operation):
+    while True:
+        result = compute.globalOperations().wait(project=project, operation=operation).execute()
+        if result['status'] == 'DONE':
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            return result
+
+
+def create_vm2(startup_script):
+    image = compute.images().getFromFamily(
+        project='ubuntu-os-cloud', family='ubuntu-2204-lts').execute()
+    config = {
+        'name': VM2_NAME,
+        'machineType': f'zones/{ZONE}/machineTypes/{MACHINE_TYPE}',
+        'disks': [{
+            'boot': True,
+            'autoDelete': True,
+            'initializeParams': {'sourceImage': image['selfLink']},
+        }],
+        'networkInterfaces': [{
+            'network': 'global/networks/default',
+            'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}],
+        }],
+        'metadata': {
+            'items': [{'key': 'startup-script', 'value': startup_script}],
+        },
+    }
+    try:
+        operation = compute.instances().insert(project=project, zone=ZONE, body=config).execute()
+    except HttpError as e:
+        if e.resp.status == 409:
+            print(f"Instance {VM2_NAME} already exists, reusing it")
+            return
+        raise
+    wait_for_zone_operation(operation['name'])
+    print(f"Created instance {VM2_NAME}")
+
+
+def ensure_firewall_rule():
+    result = compute.firewalls().list(
+        project=project, filter=f'name = "{FIREWALL_RULE}"').execute()
+    if result.get('items'):
+        print(f"Firewall rule {FIREWALL_RULE} already exists")
+        return
+    body = {
+        'name': FIREWALL_RULE,
+        'network': 'global/networks/default',
+        'direction': 'INGRESS',
+        'sourceRanges': ['0.0.0.0/0'],
+        'targetTags': [NETWORK_TAG],
+        'allowed': [{'IPProtocol': 'tcp', 'ports': ['5000']}],
+    }
+    operation = compute.firewalls().insert(project=project, body=body).execute()
+    wait_for_global_operation(operation['name'])
+    print(f"Created firewall rule {FIREWALL_RULE}")
+
+
+def add_network_tag():
+    instance = compute.instances().get(project=project, zone=ZONE, instance=VM2_NAME).execute()
+    tags = instance.get('tags', {})
+    items = tags.get('items', [])
+    if NETWORK_TAG in items:
+        return
+    operation = compute.instances().setTags(
+        project=project, zone=ZONE, instance=VM2_NAME,
+        body={'items': items + [NETWORK_TAG], 'fingerprint': tags['fingerprint']}).execute()
+    wait_for_zone_operation(operation['name'])
+    print(f"Applied network tag {NETWORK_TAG} to {VM2_NAME}")
+
+
+with open('vm2-startup-script.sh') as f:
+    vm2_startup_script = f.read()
+
+create_vm2(vm2_startup_script)
+ensure_firewall_rule()
+add_network_tag()
+
+instance = compute.instances().get(project=project, zone=ZONE, instance=VM2_NAME).execute()
+ip = instance['networkInterfaces'][0]['accessConfigs'][0]['natIP']
+print(f"VM-2 flask application: http://{ip}:5000")
